@@ -14,9 +14,15 @@ const CONFIG = {
   cartReservationMinutes: 20,
   checkIntervalMs: 60 * 1000,
   authorization: process.env.ZALANDO_TOKEN || "",
+  refreshToken: process.env.ZALANDO_REFRESH_TOKEN || "",
   salesChannel: "a332da49-a665-4a13-bd44-1ecea09b4d86",
-  appDomainId: "18"
+  appDomainId: "18",
+  tokenExpiresAt: null,
+  tokenRefreshIntervalMs: 50 * 60 * 1000 // Refresh every 50 minutes (token expires in 60 min)
 };
+
+// Token refresh interval reference
+let tokenRefreshInterval = null;
 
 // Store monitored products
 const monitoredProducts = new Map();
@@ -281,7 +287,7 @@ function resetTokenExpiredFlag() {
   tokenExpiredNotificationSent = false;
 }
 
-// ============== MONITORING LOGIC ==============
+// ============== UTILITY FUNCTIONS ==============
 
 function getTimestamp() {
   return new Date().toLocaleString('fr-FR', {
@@ -289,6 +295,152 @@ function getTimestamp() {
     hour: '2-digit', minute: '2-digit', second: '2-digit'
   });
 }
+
+// ============== TOKEN REFRESH LOGIC ==============
+
+function refreshAccessToken() {
+  return new Promise((resolve, reject) => {
+    if (!CONFIG.refreshToken) {
+      reject(new Error('No refresh token configured'));
+      return;
+    }
+
+    const postData = `refresh_token=${encodeURIComponent(CONFIG.refreshToken)}&client_id=lounge&grant_type=refresh_token`;
+
+    const options = {
+      hostname: 'customer-iam.zalandoapis.com',
+      port: 443,
+      path: '/token',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+        'User-Agent': 'Prive/614 CFNetwork/3860.300.31 Darwin/25.2.0',
+        'Accept': '*/*',
+        'Accept-Language': 'fr-FR,fr;q=0.9',
+        'Content-Length': Buffer.byteLength(postData)
+      }
+    };
+
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', (chunk) => { data += chunk; });
+      res.on('end', () => {
+        try {
+          const response = JSON.parse(data);
+          
+          if (response.access_token && response.refresh_token) {
+            resolve(response);
+          } else {
+            reject(new Error(`Token refresh failed: ${data}`));
+          }
+        } catch (error) {
+          reject(new Error(`Parse error: ${error.message} - Response: ${data}`));
+        }
+      });
+    });
+
+    req.on('error', (error) => reject(error));
+    req.write(postData);
+    req.end();
+  });
+}
+
+function sendTokenRefreshedNotification() {
+  const embed = {
+    title: "✅ TOKEN RAFRAÎCHI",
+    color: 0x22c55e, // Green
+    description: "Le token Zalando Privé a été automatiquement rafraîchi.",
+    fields: [
+      { name: "⏰ Prochain refresh", value: "Dans ~50 minutes", inline: true },
+      { name: "📊 Statut", value: "Monitoring actif", inline: true }
+    ],
+    footer: { text: "Zalando Privé Monitor - Auto Refresh" },
+    timestamp: new Date().toISOString()
+  };
+
+  return sendDiscordWebhook({
+    content: "✅ **Token rafraîchi automatiquement**",
+    embeds: [embed]
+  });
+}
+
+function sendTokenRefreshFailedNotification(errorMessage) {
+  const embed = {
+    title: "❌ ÉCHEC DU REFRESH TOKEN",
+    color: 0xf87171, // Red
+    description: "Impossible de rafraîchir le token automatiquement. Mise à jour manuelle requise.",
+    fields: [
+      { name: "❌ Erreur", value: `\`${errorMessage}\``, inline: false },
+      { name: "🔧 Action requise", value: "Mettez à jour le refresh_token via Railway ou l'interface web", inline: false }
+    ],
+    footer: { text: "Zalando Privé Monitor" },
+    timestamp: new Date().toISOString()
+  };
+
+  return sendDiscordWebhook({
+    content: "@everyone ❌ **ÉCHEC REFRESH TOKEN - MISE À JOUR MANUELLE REQUISE!**",
+    embeds: [embed]
+  });
+}
+
+async function performTokenRefresh() {
+  console.log(`[${getTimestamp()}] 🔄 Attempting to refresh access token...`);
+  
+  try {
+    const tokenResponse = await refreshAccessToken();
+    
+    // Update tokens in CONFIG
+    CONFIG.authorization = `Bearer ${tokenResponse.access_token}`;
+    CONFIG.refreshToken = tokenResponse.refresh_token;
+    CONFIG.tokenExpiresAt = Date.now() + (tokenResponse.expires_in * 1000);
+    
+    // Reset the expired notification flag since we have a new valid token
+    resetTokenExpiredFlag();
+    
+    console.log(`[${getTimestamp()}] ✅ Token refreshed successfully! Expires in ${tokenResponse.expires_in}s`);
+    
+    // Send Discord notification
+    await sendTokenRefreshedNotification();
+    
+    return true;
+  } catch (error) {
+    console.error(`[${getTimestamp()}] ❌ Token refresh failed:`, error.message);
+    
+    // Send Discord notification about failure
+    await sendTokenRefreshFailedNotification(error.message);
+    
+    return false;
+  }
+}
+
+function startTokenRefresh() {
+  if (tokenRefreshInterval) {
+    console.log(`[${getTimestamp()}] Token refresh already running`);
+    return;
+  }
+  
+  if (!CONFIG.refreshToken) {
+    console.log(`[${getTimestamp()}] ⚠️ No refresh token configured - automatic refresh disabled`);
+    return;
+  }
+  
+  // Perform initial refresh
+  performTokenRefresh();
+  
+  // Set up interval for automatic refresh (every 50 minutes)
+  tokenRefreshInterval = setInterval(performTokenRefresh, CONFIG.tokenRefreshIntervalMs);
+  console.log(`[${getTimestamp()}] 🔄 Token auto-refresh started (every 50 min)`);
+}
+
+function stopTokenRefresh() {
+  if (tokenRefreshInterval) {
+    clearInterval(tokenRefreshInterval);
+    tokenRefreshInterval = null;
+    console.log(`[${getTimestamp()}] Token auto-refresh stopped`);
+  }
+}
+
+// ============== MONITORING LOGIC ==============
 
 async function monitorAllProducts() {
   for (const [key, product] of monitoredProducts) {
@@ -559,16 +711,40 @@ app.post('/api/products/:key/reset', (req, res) => {
 });
 
 app.post('/api/config/token', (req, res) => {
-  const { token } = req.body;
+  const { token, refreshToken } = req.body;
   
-  if (!token) {
-    return res.status(400).json({ error: 'Token is required' });
+  if (!token && !refreshToken) {
+    return res.status(400).json({ error: 'Token or refreshToken is required' });
   }
   
-  CONFIG.authorization = token.startsWith('Bearer ') ? token : `Bearer ${token}`;
+  if (token) {
+    CONFIG.authorization = token.startsWith('Bearer ') ? token : `Bearer ${token}`;
+    console.log(`[${getTimestamp()}] Access token updated via API`);
+  }
+  
+  if (refreshToken) {
+    CONFIG.refreshToken = refreshToken;
+    console.log(`[${getTimestamp()}] Refresh token updated via API`);
+    // Start auto-refresh if not already running
+    startTokenRefresh();
+  }
+  
   resetTokenExpiredFlag();
-  console.log(`[${getTimestamp()}] Token updated via API`);
-  res.json({ success: true, message: 'Token updated' });
+  res.json({ success: true, message: 'Token(s) updated' });
+});
+
+// Manual token refresh endpoint
+app.post('/api/config/refresh', async (req, res) => {
+  try {
+    const success = await performTokenRefresh();
+    if (success) {
+      res.json({ success: true, message: 'Token refreshed successfully' });
+    } else {
+      res.status(500).json({ error: 'Token refresh failed' });
+    }
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
 app.get('/', (req, res) => {
@@ -622,4 +798,12 @@ app.listen(PORT, '0.0.0.0', () => {
 ║  Health check: /health or /ping                              ║
 ╚══════════════════════════════════════════════════════════════╝
   `);
+  
+  // Start automatic token refresh if refresh token is configured
+  if (CONFIG.refreshToken) {
+    console.log(`[${getTimestamp()}] 🔄 Starting automatic token refresh...`);
+    startTokenRefresh();
+  } else {
+    console.log(`[${getTimestamp()}] ⚠️ No ZALANDO_REFRESH_TOKEN configured - manual token updates required`);
+  }
 });
