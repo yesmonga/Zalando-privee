@@ -1,7 +1,12 @@
 const express = require('express');
 const https = require('https');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
+
+// Data persistence file path
+const DATA_FILE = path.join(__dirname, 'data', 'products.json');
 app.use(express.json());
 app.use(express.static('public'));
 
@@ -29,6 +34,71 @@ const monitoredProducts = new Map();
 
 // Monitoring interval reference
 let monitoringInterval = null;
+
+// ============== DATA PERSISTENCE ==============
+
+function ensureDataDir() {
+  const dataDir = path.dirname(DATA_FILE);
+  if (!fs.existsSync(dataDir)) {
+    fs.mkdirSync(dataDir, { recursive: true });
+  }
+}
+
+function saveProducts() {
+  try {
+    ensureDataDir();
+    
+    const data = [];
+    for (const [key, product] of monitoredProducts) {
+      data.push({
+        key,
+        articleId: product.articleId,
+        productInfo: product.productInfo,
+        sizeMapping: product.sizeMapping,
+        simpleSkus: product.simpleSkus,
+        watchedSizes: Array.from(product.watchedSizes),
+        notified: Array.from(product.notified)
+      });
+    }
+    
+    fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
+    console.log(`[${getTimestamp()}] 💾 Saved ${data.length} products to disk`);
+  } catch (error) {
+    console.error(`[${getTimestamp()}] ❌ Error saving products:`, error.message);
+  }
+}
+
+function loadProducts() {
+  try {
+    if (!fs.existsSync(DATA_FILE)) {
+      console.log(`[${getTimestamp()}] 📂 No saved products found`);
+      return;
+    }
+    
+    const data = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+    
+    for (const item of data) {
+      monitoredProducts.set(item.key, {
+        articleId: item.articleId,
+        productInfo: item.productInfo,
+        sizeMapping: item.sizeMapping,
+        simpleSkus: item.simpleSkus,
+        watchedSizes: new Set(item.watchedSizes),
+        previousStock: {}, // Will be refreshed on first check
+        notified: new Set(item.notified)
+      });
+    }
+    
+    console.log(`[${getTimestamp()}] 📂 Loaded ${data.length} products from disk`);
+    
+    // Start monitoring if we have products
+    if (monitoredProducts.size > 0) {
+      startMonitoring();
+    }
+  } catch (error) {
+    console.error(`[${getTimestamp()}] ❌ Error loading products:`, error.message);
+  }
+}
 
 // ============== ZALANDO API FUNCTIONS ==============
 
@@ -641,6 +711,9 @@ app.post('/api/products/add', async (req, res) => {
       notified: notifiedSet
     });
 
+    // Save to disk
+    saveProducts();
+    
     startMonitoring();
 
     res.json({ 
@@ -673,6 +746,9 @@ app.delete('/api/products/:key', (req, res) => {
   if (monitoredProducts.has(key)) {
     monitoredProducts.delete(key);
     
+    // Save to disk
+    saveProducts();
+    
     if (monitoredProducts.size === 0) {
       stopMonitoring();
     }
@@ -694,6 +770,9 @@ app.put('/api/products/:key/sizes', (req, res) => {
   const product = monitoredProducts.get(key);
   product.watchedSizes = new Set(watchedSizes);
   
+  // Save to disk
+  saveProducts();
+  
   res.json({ success: true, watchedSizes: Array.from(product.watchedSizes) });
 });
 
@@ -706,6 +785,9 @@ app.post('/api/products/:key/reset', (req, res) => {
   
   const product = monitoredProducts.get(key);
   product.notified.clear();
+  
+  // Save to disk
+  saveProducts();
   
   res.json({ success: true, message: 'Cart tracking reset' });
 });
@@ -798,6 +880,9 @@ app.listen(PORT, '0.0.0.0', () => {
 ║  Health check: /health or /ping                              ║
 ╚══════════════════════════════════════════════════════════════╝
   `);
+  
+  // Load saved products from disk
+  loadProducts();
   
   // Start automatic token refresh if refresh token is configured
   if (CONFIG.refreshToken) {
