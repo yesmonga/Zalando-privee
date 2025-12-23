@@ -224,6 +224,8 @@ function sendDiscordWebhook(payload) {
 }
 
 function sendDiscordNotification(productInfo, simpleSku, size, quantity, productUrl) {
+  const checkoutUrl = 'https://www.zalando-prive.fr/checkout';
+  
   const embed = {
     title: "🚨 STOCK DISPONIBLE!",
     color: 0xff6900, // Zalando orange
@@ -233,7 +235,8 @@ function sendDiscordNotification(productInfo, simpleSku, size, quantity, product
       { name: "📏 Taille", value: `**${size}**`, inline: true },
       { name: "📦 Quantité", value: `${quantity} dispo`, inline: true },
       { name: "💰 Prix", value: `${productInfo.price} (${productInfo.discount})`, inline: false },
-      { name: "🔗 Lien produit", value: `[Ajouter au panier](${productUrl})`, inline: false }
+      { name: "🔗 Lien produit", value: `[Voir le produit](${productUrl})`, inline: true },
+      { name: "🛒 Checkout", value: `[Aller au panier](${checkoutUrl})`, inline: true }
     ],
     footer: { text: `SKU: ${simpleSku}` },
     timestamp: new Date().toISOString()
@@ -461,6 +464,21 @@ app.post('/api/products/add', async (req, res) => {
     const { productInfo, sizeMapping, simpleSkus } = await fetchProductDetails(campaignId, articleId);
     const stockInfo = await checkStock(productInfo.configSku, simpleSkus, campaignId);
     
+    const notifiedSet = new Set();
+    const productUrl = `https://www.zalando-prive.fr/campaigns/${campaignId}/articles/${articleId}`;
+    
+    // Check if any watched size is already in stock and send notification immediately
+    for (const sku of watchedSizes) {
+      const stock = stockInfo[sku];
+      if (stock && stock.inStock && stock.quantity > 0) {
+        const size = sizeMapping[sku]?.size || sku;
+        console.log(`🚨 Size ${size} already in stock (${stock.quantity}) - sending notification!`);
+        
+        await sendDiscordNotification(productInfo, sku, size, stock.quantity, productUrl);
+        notifiedSet.add(sku);
+      }
+    }
+    
     monitoredProducts.set(key, {
       articleId,
       productInfo,
@@ -468,7 +486,7 @@ app.post('/api/products/add', async (req, res) => {
       simpleSkus,
       watchedSizes: new Set(watchedSizes),
       previousStock: stockInfo,
-      notified: new Set()
+      notified: notifiedSet
     });
 
     startMonitoring();
@@ -476,7 +494,8 @@ app.post('/api/products/add', async (req, res) => {
     res.json({ 
       success: true, 
       message: `Now monitoring ${productInfo.brand} - ${productInfo.title}`,
-      watchedSizes: watchedSizes.map(sku => sizeMapping[sku]?.size || sku)
+      watchedSizes: watchedSizes.map(sku => sizeMapping[sku]?.size || sku),
+      alreadyInStock: Array.from(notifiedSet).map(sku => sizeMapping[sku]?.size || sku)
     });
   } catch (error) {
     console.error(`[${getTimestamp()}] Add product error:`, error.message);
