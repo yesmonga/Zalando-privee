@@ -1,15 +1,18 @@
 # Zalando Privé Stock Monitor 🛒
 
-Bot de surveillance de stock Zalando Privé avec ajout automatique au panier et notifications Discord.
+Bot de surveillance de stock Zalando Privé avec notifications Discord instantanées.
 
 ## Fonctionnalités
 
 - ✅ Interface web mobile-friendly pour gérer les produits
 - ✅ Surveillance automatique du stock toutes les 60 secondes
-- ✅ Ajout automatique au panier dès qu'une taille surveillée revient en stock
-- ✅ Notifications Discord avec deadline de checkout (~20 min)
+- ✅ **Notifications Discord** dès qu'une taille surveillée revient en stock
+- ✅ Lien direct vers le produit pour ajouter rapidement au panier
 - ✅ Support multi-produits
 - ✅ Parsing automatique des URLs Zalando Privé
+- ✅ Alerte Discord quand le token expire
+
+> ⚠️ **Note**: L'ajout automatique au panier n'est pas possible car Zalando utilise une protection anti-bot (Akamai). Le bot vous notifie instantanément et vous ajoutez manuellement via l'app/site.
 
 ## Déploiement sur Railway
 
@@ -39,7 +42,7 @@ Bot de surveillance de stock Zalando Privé avec ajout automatique au panier et 
 4. Sélectionnez les tailles à surveiller (celles en rupture)
 5. Cliquez sur "Ajouter au monitoring"
 
-Le bot surveillera le stock et ajoutera automatiquement au panier + enverra une notification Discord dès qu'une taille revient en stock.
+**Dès qu'une taille revient en stock**, vous recevez une notification Discord avec le lien direct pour ajouter au panier.
 
 ## Format des URLs
 
@@ -50,7 +53,7 @@ https://www.zalando-prive.fr/campaigns/ZZO459V/categories/200814106/articles/ZZO
 
 ## ⚠️ Mise à jour du token
 
-Le token JWT expire régulièrement. Pour le mettre à jour :
+Le token JWT expire régulièrement (~2h). Pour le mettre à jour :
 
 1. Via l'interface web : Section "Paramètres du token"
 2. Collez le token (avec ou sans "Bearer ")

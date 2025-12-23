@@ -26,34 +26,41 @@ let monitoringInterval = null;
 
 // ============== ZALANDO API FUNCTIONS ==============
 
-function makeRequest(method, path, body = null) {
+function makeRequest(method, path, body = null, isCartRequest = false) {
   return new Promise((resolve, reject) => {
     const postData = body ? JSON.stringify(body) : null;
+
+    const headers = {
+      'User-Agent': 'Client/ios-app AppVersion/614 AppVersionName/4.72.0 AppDomain/18 OS/26.2',
+      'X-Device-Type': 'smartphone',
+      'X-Zalando-Client-Id': '53BEFF53-D469-4DDA-913E-33F4555D2CEE',
+      'X-Device-OS': 'iOS',
+      'X-Flow-Id': `I${Date.now().toString(16).toUpperCase()}-${Math.random().toString(16).slice(2, 6)}`,
+      'X-Sales-Channel': CONFIG.salesChannel,
+      'X-App-Version': '4.72.0',
+      'Authorization': CONFIG.authorization,
+      'zmobile-os': 'ios',
+      'Accept-Language': 'fr-FR',
+      'X-APPDOMAINID': CONFIG.appDomainId,
+      'CLIENT_TYPE': 'ios-app',
+      'Accept': 'application/json,application/problem+json',
+      'Content-Type': 'application/json',
+      'X-IOS-VERSION': '4.72.0',
+      'X-API-VERSION': 'v1',
+      'Connection': 'keep-alive'
+    };
+
+    // Add cart-specific headers
+    if (isCartRequest) {
+      headers['x-enable-unreserved-cart'] = 'true';
+    }
 
     const options = {
       hostname: 'api.zalando-lounge.com',
       port: 443,
       path: path,
       method: method,
-      headers: {
-        'User-Agent': 'Client/ios-app AppVersion/614 AppVersionName/4.72.0 AppDomain/18 OS/26.2',
-        'X-Device-Type': 'smartphone',
-        'X-Zalando-Client-Id': '53BEFF53-D469-4DDA-913E-33F4555D2CEE',
-        'X-Device-OS': 'iOS',
-        'X-Flow-Id': `I${Date.now().toString(16).toUpperCase()}-${Math.random().toString(16).slice(2, 6)}`,
-        'X-Sales-Channel': CONFIG.salesChannel,
-        'X-App-Version': '4.72.0',
-        'Authorization': CONFIG.authorization,
-        'zmobile-os': 'ios',
-        'Accept-Language': 'fr-FR',
-        'X-APPDOMAINID': CONFIG.appDomainId,
-        'CLIENT_TYPE': 'ios-app',
-        'Accept': 'application/json,application/problem+json',
-        'Content-Type': 'application/json',
-        'X-IOS-VERSION': '4.72.0',
-        'X-API-VERSION': 'v1',
-        'Connection': 'keep-alive'
-      }
+      headers: headers
     };
 
     if (postData) {
@@ -166,7 +173,7 @@ async function addToCart(configSku, simpleSku, campaignId) {
     simpleSku: simpleSku
   };
 
-  const response = await makeRequest('POST', path, body);
+  const response = await makeRequest('POST', path, body, true); // isCartRequest = true
   
   // Check if item was added successfully
   if (response && response.items && response.items.length > 0) {
@@ -216,24 +223,24 @@ function sendDiscordWebhook(payload) {
   });
 }
 
-function sendDiscordNotification(productInfo, simpleSku, size, deadlineStr) {
+function sendDiscordNotification(productInfo, simpleSku, size, quantity, productUrl) {
   const embed = {
-    title: "🛒 ARTICLE AJOUTÉ AU PANIER!",
+    title: "🚨 STOCK DISPONIBLE!",
     color: 0xff6900, // Zalando orange
     fields: [
       { name: "👕 Produit", value: `**${productInfo.brand} - ${productInfo.title}**`, inline: false },
       { name: "🎨 Couleur", value: productInfo.color || '-', inline: true },
       { name: "📏 Taille", value: `**${size}**`, inline: true },
-      { name: "💰 Prix", value: `${productInfo.price} (${productInfo.discount})`, inline: true },
-      { name: "⏰ CHECKOUT AVANT", value: `**${deadlineStr}**`, inline: false },
-      { name: "🛒 Lien Checkout", value: `[Aller au panier](${CONFIG.checkoutUrl})`, inline: false }
+      { name: "📦 Quantité", value: `${quantity} dispo`, inline: true },
+      { name: "💰 Prix", value: `${productInfo.price} (${productInfo.discount})`, inline: false },
+      { name: "🔗 Lien produit", value: `[Ajouter au panier](${productUrl})`, inline: false }
     ],
-    footer: { text: `Article: ${simpleSku}` },
+    footer: { text: `SKU: ${simpleSku}` },
     timestamp: new Date().toISOString()
   };
 
   return sendDiscordWebhook({
-    content: "@everyone 🛒 **NOUVEAU STOCK DISPONIBLE - CHECKOUT MAINTENANT!**",
+    content: "@everyone 🚨 **NOUVEAU STOCK - AJOUTE VITE AU PANIER!**",
     embeds: [embed]
   });
 }
@@ -300,30 +307,31 @@ async function monitorAllProducts() {
         
         // Check if this size is being watched and stock became available
         if (product.watchedSizes.has(simpleSku) && wasOutOfStock && nowInStock) {
-          if (!product.addedToCart.has(simpleSku)) {
+          if (!product.notified.has(simpleSku)) {
             console.log(`🚨 NEW STOCK: ${size} (${simpleSku}) - ${stockData.quantity} units!`);
             
-            const result = await addToCart(
-              product.productInfo.configSku,
-              simpleSku,
-              product.productInfo.campaignId
+            // Mark as notified to avoid spam
+            product.notified.add(simpleSku);
+            
+            // Build product URL
+            const productUrl = `https://www.zalando-prive.fr/campaigns/${product.productInfo.campaignId}/articles/${product.articleId}`;
+            
+            // Send notification (no auto add to cart due to Akamai protection)
+            await sendDiscordNotification(
+              product.productInfo, 
+              simpleSku, 
+              size, 
+              stockData.quantity,
+              productUrl
             );
             
-            if (result.success) {
-              product.addedToCart.add(simpleSku);
-              
-              const now = new Date();
-              const deadline = new Date(now.getTime() + (result.remainingSeconds * 1000));
-              const deadlineStr = deadline.toLocaleString('fr-FR', {
-                day: '2-digit', month: '2-digit', year: 'numeric',
-                hour: '2-digit', minute: '2-digit'
-              });
-              
-              console.log(`✅ Added to cart! Checkout before: ${deadlineStr}`);
-              
-              await sendDiscordNotification(product.productInfo, simpleSku, size, deadlineStr);
-            }
+            console.log(`📢 Discord notification sent!`);
           }
+        }
+        
+        // Reset notification if item goes out of stock again (so we notify again if it comes back)
+        if (product.notified.has(simpleSku) && !nowInStock) {
+          product.notified.delete(simpleSku);
         }
       }
       
@@ -373,7 +381,7 @@ app.get('/api/products', (req, res) => {
       sizeMapping: product.sizeMapping,
       watchedSizes: Array.from(product.watchedSizes),
       currentStock: product.previousStock,
-      addedToCart: Array.from(product.addedToCart)
+      notified: Array.from(product.notified)
     });
   }
   res.json({ products, isMonitoring: !!monitoringInterval });
@@ -460,7 +468,7 @@ app.post('/api/products/add', async (req, res) => {
       simpleSkus,
       watchedSizes: new Set(watchedSizes),
       previousStock: stockInfo,
-      addedToCart: new Set()
+      notified: new Set()
     });
 
     startMonitoring();
@@ -526,7 +534,7 @@ app.post('/api/products/:key/reset', (req, res) => {
   }
   
   const product = monitoredProducts.get(key);
-  product.addedToCart.clear();
+  product.notified.clear();
   
   res.json({ success: true, message: 'Cart tracking reset' });
 });
@@ -566,6 +574,22 @@ app.get('/health', (req, res) => {
 
 app.get('/ping', (req, res) => {
   res.send('pong');
+});
+
+// Test endpoint for add to cart
+app.post('/api/test/addtocart', async (req, res) => {
+  try {
+    const { configSku, simpleSku, campaignId } = req.body;
+    
+    if (!configSku || !simpleSku || !campaignId) {
+      return res.status(400).json({ error: 'configSku, simpleSku, and campaignId are required' });
+    }
+    
+    const result = await addToCart(configSku, simpleSku, campaignId);
+    res.json({ success: result.success, result });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
 const serverStartTime = new Date();
