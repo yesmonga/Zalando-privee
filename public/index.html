@@ -313,15 +313,11 @@
       cursor: pointer;
       transition: all 0.2s ease;
       text-align: center;
+      position: relative;
     }
 
     .size-item:hover {
       border-color: rgba(255,255,255,0.3);
-    }
-
-    .size-item.selected {
-      border-color: #ff6900;
-      background: rgba(255, 105, 0, 0.2);
     }
 
     .size-item.out-of-stock {
@@ -332,6 +328,33 @@
     .size-item.in-stock {
       border-color: rgba(34, 197, 94, 0.4);
       background: rgba(34, 197, 94, 0.15);
+    }
+
+    .size-item.selected {
+      border: 3px solid #ff6900 !important;
+      background: rgba(255, 105, 0, 0.35) !important;
+      box-shadow: 0 0 20px rgba(255, 105, 0, 0.5);
+      transform: scale(1.05);
+    }
+
+    .size-item.selected .size-name {
+      color: #ff6900;
+    }
+
+    .size-item.selected::after {
+      content: '✓';
+      position: absolute;
+      top: -8px;
+      right: -8px;
+      background: #ff6900;
+      color: white;
+      width: 20px;
+      height: 20px;
+      border-radius: 50%;
+      font-size: 12px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
     }
 
     .size-item .size-name {
