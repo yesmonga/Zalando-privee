@@ -17,12 +17,28 @@ const CONFIG = {
   refreshToken: process.env.ZALANDO_REFRESH_TOKEN || "",
   salesChannel: "a332da49-a665-4a13-bd44-1ecea09b4d86",
   appDomainId: "18",
-  tokenRefreshIntervalMs: 50 * 60 * 1000 // Refresh every 50 minutes (token expires in 60 min)
+  tokenRefreshIntervalMs: 50 * 60 * 1000, // Refresh every 50 minutes (token expires in 60 min)
+  autoAddToCart: true // Enable automatic add to cart when stock is detected
+};
+
+// Session data for Akamai protection (updated via API or environment)
+const SESSION = {
+  cookies: {
+    _abck: process.env.AKAMAI_ABCK || "",
+    ak_bmsc: process.env.AKAMAI_BMSC || "",
+    bm_sz: process.env.AKAMAI_BMSZ || ""
+  },
+  sensorData: process.env.AKAMAI_SENSOR_DATA || "",
+  lastUpdated: null
 };
 
 // Token refresh interval reference
 let tokenRefreshInterval = null;
 let lastTokenRefresh = null;
+
+// Cart auto-prolongation interval reference
+let cartProlongInterval = null;
+const CART_PROLONG_INTERVAL_MS = 18 * 60 * 1000; // 18 minutes
 
 // Store monitored products
 const monitoredProducts = new Map();
@@ -56,13 +72,14 @@ function makeRequest(method, path, body = null, isCartRequest = false) {
     const postData = body ? JSON.stringify(body) : null;
 
     const headers = {
-      'User-Agent': 'Client/ios-app AppVersion/614 AppVersionName/4.72.0 AppDomain/18 OS/26.2',
+      'User-Agent': 'Client/ios-app AppVersion/615 AppVersionName/4.72.1 AppDomain/18 OS/26.2',
       'X-Device-Type': 'smartphone',
       'X-Zalando-Client-Id': '53BEFF53-D469-4DDA-913E-33F4555D2CEE',
       'X-Device-OS': 'iOS',
-      'X-Flow-Id': `I${Date.now().toString(16).toUpperCase()}-${Math.random().toString(16).slice(2, 6)}`,
+      'X-Flow-Id': `I${Date.now().toString(16).toUpperCase()}-${Math.random().toString(16).slice(2, 6)}-${Math.floor(Math.random() * 100)}`,
+      'ot-baggage-traffic_src': 'deeplink',
       'X-Sales-Channel': CONFIG.salesChannel,
-      'X-App-Version': '4.72.0',
+      'X-App-Version': '4.72.1',
       'Authorization': CONFIG.authorization,
       'zmobile-os': 'ios',
       'Accept-Language': 'fr-FR',
@@ -70,14 +87,30 @@ function makeRequest(method, path, body = null, isCartRequest = false) {
       'CLIENT_TYPE': 'ios-app',
       'Accept': 'application/json,application/problem+json',
       'Content-Type': 'application/json',
-      'X-IOS-VERSION': '4.72.0',
+      'X-IOS-VERSION': '4.72.1',
       'X-API-VERSION': 'v1',
-      'Connection': 'keep-alive'
+      'Connection': 'keep-alive',
+      'Accept-Encoding': 'gzip, deflate'
     };
 
-    // Add cart-specific headers
+    // Add cart-specific headers including Akamai protection
     if (isCartRequest) {
       headers['x-enable-unreserved-cart'] = 'true';
+      
+      // Add Akamai cookies if available
+      const cookieParts = [];
+      if (SESSION.cookies._abck) cookieParts.push(`_abck=${SESSION.cookies._abck}`);
+      if (SESSION.cookies.ak_bmsc) cookieParts.push(`ak_bmsc=${SESSION.cookies.ak_bmsc}`);
+      if (SESSION.cookies.bm_sz) cookieParts.push(`bm_sz=${SESSION.cookies.bm_sz}`);
+      
+      if (cookieParts.length > 0) {
+        headers['Cookie'] = cookieParts.join('; ');
+      }
+      
+      // Add sensor data if available
+      if (SESSION.sensorData) {
+        headers['X-acf-sensor-data'] = SESSION.sensorData;
+      }
     }
 
     const options = {
@@ -93,9 +126,20 @@ function makeRequest(method, path, body = null, isCartRequest = false) {
     }
 
     const req = https.request(options, (res) => {
-      let data = '';
-      res.on('data', (chunk) => { data += chunk; });
-      res.on('end', () => {
+      let chunks = [];
+      
+      // Handle gzip/deflate compression
+      let stream = res;
+      if (res.headers['content-encoding'] === 'gzip') {
+        stream = res.pipe(require('zlib').createGunzip());
+      } else if (res.headers['content-encoding'] === 'deflate') {
+        stream = res.pipe(require('zlib').createInflate());
+      }
+      
+      stream.on('data', (chunk) => { chunks.push(chunk); });
+      stream.on('end', () => {
+        const data = Buffer.concat(chunks).toString('utf8');
+        
         // Check for HTTP-level auth errors
         if (res.statusCode === 401 || res.statusCode === 403) {
           reject(new Error(`Unauthorized (${res.statusCode}) - Token expired or invalid`));
@@ -107,6 +151,12 @@ function makeRequest(method, path, body = null, isCartRequest = false) {
           return;
         }
         
+        // Handle empty response (e.g., 204 No Content)
+        if (!data || data.trim() === '') {
+          resolve({});
+          return;
+        }
+        
         try {
           const response = JSON.parse(data);
           resolve(response);
@@ -114,6 +164,7 @@ function makeRequest(method, path, body = null, isCartRequest = false) {
           reject(new Error(`Parse error: ${error.message}`));
         }
       });
+      stream.on('error', (error) => reject(error));
     });
 
     req.on('error', (error) => reject(error));
@@ -189,26 +240,153 @@ async function checkStock(configSku, simpleSkus, campaignId) {
   return stockInfo;
 }
 
-async function addToCart(configSku, simpleSku, campaignId) {
+async function addToCart(configSku, simpleSku, campaignId, useAkamai = true) {
   const path = '/stockcart/cart/items';
   const body = {
-    configSku: configSku,
-    quantity: "1",
     campaignIdentifier: campaignId,
-    simpleSku: simpleSku
+    quantity: "1",
+    simpleSku: simpleSku,
+    configSku: configSku
   };
 
-  const response = await makeRequest('POST', path, body, true); // isCartRequest = true
+  console.log(`[${getTimestamp()}] 🛒 Attempting to add to cart: ${simpleSku} (Akamai: ${useAkamai})`);
   
-  // Check if item was added successfully
-  if (response && response.items && response.items.length > 0) {
-    return {
-      success: true,
-      remainingSeconds: response.remainingLifetimeSeconds || 1200
-    };
+  try {
+    const response = await makeRequest('POST', path, body, useAkamai); // isCartRequest controls Akamai headers
+    
+    // Check if item was added successfully
+    if (response && response.items && response.items.length > 0) {
+      const addedItem = response.items.find(item => item.simpleSku === simpleSku);
+      console.log(`[${getTimestamp()}] ✅ Successfully added to cart: ${simpleSku}`);
+      
+      // Start auto-prolongation when item is added
+      startCartProlongation();
+      
+      return {
+        success: true,
+        remainingSeconds: response.remainingLifetimeSeconds || 1200,
+        cartType: response.cartType,
+        item: addedItem,
+        totalItems: response.items.length
+      };
+    }
+    
+    console.log(`[${getTimestamp()}] ❌ Add to cart failed - no items in response`);
+    return { success: false, error: 'No items in response' };
+  } catch (error) {
+    console.error(`[${getTimestamp()}] ❌ Add to cart error: ${error.message}`);
+    return { success: false, error: error.message };
+  }
+}
+
+// ============== CART MANAGEMENT ==============
+
+async function getCart() {
+  const path = '/stockcart/cart';
+  
+  console.log(`[${getTimestamp()}] 🛒 Checking cart contents...`);
+  
+  try {
+    const response = await makeRequest('GET', path, null, true); // isCartRequest = true for Akamai headers
+    
+    if (response && response.items) {
+      console.log(`[${getTimestamp()}] ✅ Cart has ${response.items.length} items, ${response.remainingLifetimeSeconds}s remaining`);
+      
+      return {
+        success: true,
+        items: response.items,
+        totalItems: response.items.length,
+        remainingSeconds: response.remainingLifetimeSeconds,
+        prolongCounter: response.prolongCounter || 0,
+        expired: response.expired,
+        cartType: response.cartType,
+        price: response.price
+      };
+    }
+    
+    return { success: true, items: [], totalItems: 0 };
+  } catch (error) {
+    console.error(`[${getTimestamp()}] ❌ Get cart error: ${error.message}`);
+    return { success: false, error: error.message };
+  }
+}
+
+async function extendCart() {
+  const path = '/stockcart/cart';
+  
+  console.log(`[${getTimestamp()}] ⏰ Extending cart reservation...`);
+  
+  try {
+    // PUT returns 204 No Content on success, so we make the request then fetch cart state
+    await makeRequest('PUT', path, null, true);
+    
+    // Fetch updated cart state
+    const cartState = await getCart();
+    
+    if (cartState.success) {
+      const minutes = Math.floor(cartState.remainingSeconds / 60);
+      console.log(`[${getTimestamp()}] ✅ Cart extended! ${minutes} minutes remaining (prolong #${cartState.prolongCounter || 1})`);
+      
+      return {
+        success: true,
+        remainingSeconds: cartState.remainingSeconds,
+        prolongCounter: cartState.prolongCounter || 1,
+        items: cartState.items,
+        totalItems: cartState.totalItems,
+        cartType: cartState.cartType
+      };
+    }
+    
+    return { success: false, error: 'Failed to get cart state after extend' };
+  } catch (error) {
+    console.error(`[${getTimestamp()}] ❌ Extend cart error: ${error.message}`);
+    return { success: false, error: error.message };
+  }
+}
+
+// ============== CART AUTO-PROLONGATION ==============
+
+async function checkAndProlongCart() {
+  console.log(`[${getTimestamp()}] 🔄 Auto-prolong: Checking cart...`);
+  
+  try {
+    const cartState = await getCart();
+    
+    if (cartState.success && cartState.totalItems > 0) {
+      console.log(`[${getTimestamp()}] 🛒 Cart has ${cartState.totalItems} items, extending...`);
+      const extendResult = await extendCart();
+      
+      if (extendResult.success) {
+        const minutes = Math.floor(extendResult.remainingSeconds / 60);
+        console.log(`[${getTimestamp()}] ✅ Auto-prolong: Cart extended! ${minutes} min remaining (prolong #${extendResult.prolongCounter})`);
+      } else {
+        console.log(`[${getTimestamp()}] ❌ Auto-prolong failed: ${extendResult.error}`);
+      }
+    } else {
+      console.log(`[${getTimestamp()}] 📭 Cart is empty, stopping auto-prolongation`);
+      stopCartProlongation();
+    }
+  } catch (error) {
+    console.error(`[${getTimestamp()}] ❌ Auto-prolong error: ${error.message}`);
+  }
+}
+
+function startCartProlongation() {
+  if (cartProlongInterval) {
+    console.log(`[${getTimestamp()}] ⏰ Cart prolongation already running`);
+    return;
   }
   
-  return { success: false };
+  console.log(`[${getTimestamp()}] ⏰ Starting cart auto-prolongation (every 18 min)`);
+  cartProlongInterval = setInterval(checkAndProlongCart, CART_PROLONG_INTERVAL_MS);
+}
+
+function stopCartProlongation() {
+  if (cartProlongInterval) {
+    clearInterval(cartProlongInterval);
+    cartProlongInterval = null;
+    console.log(`[${getTimestamp()}] ⏹️ Cart auto-prolongation stopped`);
+  }
 }
 
 // ============== DISCORD NOTIFICATIONS ==============
@@ -248,27 +426,49 @@ function sendDiscordWebhook(payload) {
   });
 }
 
-function sendDiscordNotification(productInfo, simpleSku, size, quantity, productUrl) {
+function sendDiscordNotification(productInfo, simpleSku, size, quantity, productUrl, cartResult = null) {
   const checkoutUrl = 'https://www.zalando-prive.fr/checkout';
   
+  // Determine if item was added to cart
+  const addedToCart = cartResult && cartResult.success;
+  const title = addedToCart ? "✅ AJOUTÉ AU PANIER!" : "🚨 STOCK DISPONIBLE!";
+  const color = addedToCart ? 0x22c55e : 0xff6900; // Green if added, orange if just detected
+  
+  const fields = [
+    { name: "👕 Produit", value: `**${productInfo.brand} - ${productInfo.title}**`, inline: false },
+    { name: "🎨 Couleur", value: productInfo.color || '-', inline: true },
+    { name: "📏 Taille", value: `**${size}**`, inline: true },
+    { name: "📦 Quantité", value: `${quantity} dispo`, inline: true },
+    { name: "💰 Prix", value: `${productInfo.price} (${productInfo.discount})`, inline: false }
+  ];
+  
+  if (addedToCart) {
+    const minutes = Math.floor(cartResult.remainingSeconds / 60);
+    fields.push({ name: "⏱️ Réservation", value: `${minutes} minutes restantes`, inline: true });
+    fields.push({ name: "🛒 Checkout", value: `[FINALISER L'ACHAT](${checkoutUrl})`, inline: true });
+  } else {
+    fields.push({ name: "🔗 Lien produit", value: `[Voir le produit](${productUrl})`, inline: true });
+    fields.push({ name: "🛒 Checkout", value: `[Aller au panier](${checkoutUrl})`, inline: true });
+    
+    if (cartResult && cartResult.error) {
+      fields.push({ name: "⚠️ Erreur ajout panier", value: `\`${cartResult.error}\``, inline: false });
+    }
+  }
+  
   const embed = {
-    title: "🚨 STOCK DISPONIBLE!",
-    color: 0xff6900, // Zalando orange
-    fields: [
-      { name: "👕 Produit", value: `**${productInfo.brand} - ${productInfo.title}**`, inline: false },
-      { name: "🎨 Couleur", value: productInfo.color || '-', inline: true },
-      { name: "📏 Taille", value: `**${size}**`, inline: true },
-      { name: "📦 Quantité", value: `${quantity} dispo`, inline: true },
-      { name: "💰 Prix", value: `${productInfo.price} (${productInfo.discount})`, inline: false },
-      { name: "🔗 Lien produit", value: `[Voir le produit](${productUrl})`, inline: true },
-      { name: "🛒 Checkout", value: `[Aller au panier](${checkoutUrl})`, inline: true }
-    ],
+    title: title,
+    color: color,
+    fields: fields,
     footer: { text: `SKU: ${simpleSku}` },
     timestamp: new Date().toISOString()
   };
 
+  const content = addedToCart 
+    ? "@everyone ✅ **ARTICLE RÉSERVÉ - FINALISEZ VOTRE ACHAT!**"
+    : "@everyone 🚨 **NOUVEAU STOCK - AJOUTE VITE AU PANIER!**";
+
   return sendDiscordWebhook({
-    content: "@everyone 🚨 **NOUVEAU STOCK - AJOUTE VITE AU PANIER!**",
+    content: content,
     embeds: [embed]
   });
 }
@@ -489,13 +689,24 @@ async function monitorAllProducts() {
             // Build product URL
             const productUrl = `https://www.zalando-prive.fr/campaigns/${product.productInfo.campaignId}/articles/${product.articleId}`;
             
-            // Send notification (no auto add to cart due to Akamai protection)
+            // Try to auto add to cart if enabled
+            let cartResult = null;
+            if (CONFIG.autoAddToCart) {
+              cartResult = await addToCart(
+                product.productInfo.configSku,
+                simpleSku,
+                product.productInfo.campaignId
+              );
+            }
+            
+            // Send notification with cart result
             await sendDiscordNotification(
               product.productInfo, 
               simpleSku, 
               size, 
               stockData.quantity,
-              productUrl
+              productUrl,
+              cartResult
             );
             
             console.log(`📢 Discord notification sent!`);
@@ -637,14 +848,24 @@ app.post('/api/products/add', async (req, res) => {
     const notifiedSet = new Set();
     const productUrl = `https://www.zalando-prive.fr/campaigns/${campaignId}/articles/${articleId}`;
     
-    // Check if any watched size is already in stock and send notification immediately
+    // Check if any watched size is already in stock and try to add to cart
+    const addedToCart = [];
     for (const sku of watchedSizes) {
       const stock = stockInfo[sku];
       if (stock && stock.inStock && stock.quantity > 0) {
         const size = sizeMapping[sku]?.size || sku;
-        console.log(`🚨 Size ${size} already in stock (${stock.quantity}) - sending notification!`);
+        console.log(`🚨 Size ${size} already in stock (${stock.quantity})!`);
         
-        await sendDiscordNotification(productInfo, sku, size, stock.quantity, productUrl);
+        // Try to auto add to cart if enabled
+        let cartResult = null;
+        if (CONFIG.autoAddToCart) {
+          cartResult = await addToCart(productInfo.configSku, sku, campaignId);
+          if (cartResult.success) {
+            addedToCart.push(size);
+          }
+        }
+        
+        await sendDiscordNotification(productInfo, sku, size, stock.quantity, productUrl, cartResult);
         notifiedSet.add(sku);
       }
     }
@@ -668,7 +889,8 @@ app.post('/api/products/add', async (req, res) => {
       success: true, 
       message: `Now monitoring ${productInfo.brand} - ${productInfo.title}`,
       watchedSizes: watchedSizes.map(sku => sizeMapping[sku]?.size || sku),
-      alreadyInStock: Array.from(notifiedSet).map(sku => sizeMapping[sku]?.size || sku)
+      alreadyInStock: Array.from(notifiedSet).map(sku => sizeMapping[sku]?.size || sku),
+      addedToCart: addedToCart
     });
   } catch (error) {
     console.error(`[${getTimestamp()}] Add product error:`, error.message);
@@ -813,6 +1035,66 @@ app.post('/api/config/refresh', async (req, res) => {
   }
 });
 
+// Endpoint to update session data (Akamai cookies and sensor data)
+app.post('/api/config/session', (req, res) => {
+  const { cookies, sensorData, clearSensorData } = req.body;
+  
+  if (!cookies && sensorData === undefined && !clearSensorData) {
+    return res.status(400).json({ error: 'cookies, sensorData, or clearSensorData is required' });
+  }
+  
+  if (clearSensorData) {
+    SESSION.sensorData = "";
+    console.log(`[${getTimestamp()}] Akamai sensor data cleared`);
+  }
+  
+  if (cookies) {
+    if (cookies._abck) SESSION.cookies._abck = cookies._abck;
+    if (cookies.ak_bmsc) SESSION.cookies.ak_bmsc = cookies.ak_bmsc;
+    if (cookies.bm_sz) SESSION.cookies.bm_sz = cookies.bm_sz;
+    console.log(`[${getTimestamp()}] Akamai cookies updated via API`);
+  }
+  
+  if (sensorData) {
+    SESSION.sensorData = sensorData;
+    console.log(`[${getTimestamp()}] Akamai sensor data updated via API`);
+  }
+  
+  SESSION.lastUpdated = new Date().toISOString();
+  
+  res.json({ 
+    success: true, 
+    message: 'Session data updated',
+    hasCookies: !!(SESSION.cookies._abck || SESSION.cookies.ak_bmsc || SESSION.cookies.bm_sz),
+    hasSensorData: !!SESSION.sensorData,
+    lastUpdated: SESSION.lastUpdated
+  });
+});
+
+// Get session status
+app.get('/api/config/session', (req, res) => {
+  res.json({
+    hasCookies: !!(SESSION.cookies._abck || SESSION.cookies.ak_bmsc || SESSION.cookies.bm_sz),
+    hasSensorData: !!SESSION.sensorData,
+    lastUpdated: SESSION.lastUpdated,
+    autoAddToCart: CONFIG.autoAddToCart
+  });
+});
+
+// Toggle auto add to cart
+app.post('/api/config/autocart', (req, res) => {
+  const { enabled } = req.body;
+  
+  if (typeof enabled !== 'boolean') {
+    return res.status(400).json({ error: 'enabled (boolean) is required' });
+  }
+  
+  CONFIG.autoAddToCart = enabled;
+  console.log(`[${getTimestamp()}] Auto add to cart ${enabled ? 'enabled' : 'disabled'}`);
+  
+  res.json({ success: true, autoAddToCart: CONFIG.autoAddToCart });
+});
+
 app.get('/', (req, res) => {
   res.sendFile(__dirname + '/public/index.html');
 });
@@ -832,6 +1114,11 @@ app.get('/health', (req, res) => {
     tokenAutoRefresh: !!tokenRefreshInterval,
     lastTokenRefresh: lastTokenRefresh ? lastTokenRefresh.toISOString() : null,
     hasRefreshToken: !!CONFIG.refreshToken,
+    autoAddToCart: CONFIG.autoAddToCart,
+    cartAutoProlongation: !!cartProlongInterval,
+    hasSessionCookies: !!(SESSION.cookies._abck || SESSION.cookies.ak_bmsc || SESSION.cookies.bm_sz),
+    hasSensorData: !!SESSION.sensorData,
+    sessionLastUpdated: SESSION.lastUpdated,
     timestamp: new Date().toISOString()
   });
 });
@@ -843,14 +1130,74 @@ app.get('/ping', (req, res) => {
 // Test endpoint for add to cart
 app.post('/api/test/addtocart', async (req, res) => {
   try {
-    const { configSku, simpleSku, campaignId } = req.body;
+    const { configSku, simpleSku, campaignId, useAkamai } = req.body;
     
     if (!configSku || !simpleSku || !campaignId) {
       return res.status(400).json({ error: 'configSku, simpleSku, and campaignId are required' });
     }
     
-    const result = await addToCart(configSku, simpleSku, campaignId);
-    res.json({ success: result.success, result });
+    // Allow testing with or without Akamai headers
+    const result = await addToCart(configSku, simpleSku, campaignId, useAkamai !== false);
+    res.json({ success: result.success, result, usedAkamai: useAkamai !== false });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get cart contents
+app.get('/api/cart', async (req, res) => {
+  try {
+    const result = await getCart();
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Extend cart reservation (prolong)
+app.put('/api/cart/extend', async (req, res) => {
+  try {
+    const result = await extendCart();
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Also support POST for extend (easier to call)
+app.post('/api/cart/extend', async (req, res) => {
+  try {
+    const result = await extendCart();
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Start/stop cart auto-prolongation
+app.post('/api/cart/autoprolong', (req, res) => {
+  const { enabled } = req.body;
+  
+  if (enabled === true) {
+    startCartProlongation();
+    res.json({ success: true, message: 'Cart auto-prolongation started', interval: '18 minutes' });
+  } else if (enabled === false) {
+    stopCartProlongation();
+    res.json({ success: true, message: 'Cart auto-prolongation stopped' });
+  } else {
+    res.json({ 
+      isRunning: !!cartProlongInterval,
+      interval: '18 minutes',
+      message: 'Send {enabled: true/false} to start/stop'
+    });
+  }
+});
+
+// Manually trigger cart check and prolong
+app.post('/api/cart/autoprolong/now', async (req, res) => {
+  try {
+    await checkAndProlongCart();
+    res.json({ success: true, message: 'Cart check and prolong triggered' });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
